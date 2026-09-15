@@ -53,20 +53,34 @@ final class Backend(apiRoot: String, http: HttpClient = Backend.client):
       }
 
   private def readTokens(n: io.circe.Json): IO[AuthError, Tokens] =
-    val at = Json.str(n, "access_token")
-    if at.isEmpty then ZIO.fail(BackendFailed("token response missing access_token"))
-    else
+    AuthError.block {
+      val at = Json.str(n, "access_token")
+      if at.isEmpty then throw BackendFailed("token response missing access_token")
       val c = n.hcursor
-      val exp =
-        c.get[String]("expires_at").toOption.filter(_.nonEmpty).map(Instant.parse)
-          .orElse(c.get[Long]("expires_in").toOption.map(sec => Instant.now.plusSeconds(sec)))
-      ZIO.succeed(
-        Tokens(
-          accessToken = at,
-          refreshToken = Json.str(n, "refresh_token"),
-          tokenType = Option(Json.str(n, "token_type")).filter(_.nonEmpty).getOrElse("Bearer"),
-          expiresAt = exp
-        )
+      val expFromAt =
+        c.get[String]("expires_at").toOption.filter(_.nonEmpty).map { s =>
+          try Instant.parse(s)
+          catch case e: Exception => throw BackendFailed(s"invalid expires_at: $s (${e.getMessage})")
+        }
+      val expFromIn = readExpiresIn(c).map(sec => Instant.now.plusSeconds(sec))
+      Tokens(
+        accessToken = at,
+        refreshToken = Json.str(n, "refresh_token"),
+        tokenType = Option(Json.str(n, "token_type")).filter(_.nonEmpty).getOrElse("Bearer"),
+        expiresAt = expFromAt.orElse(expFromIn)
+      )
+    }
+
+  private def readExpiresIn(c: io.circe.HCursor): Option[Long] =
+    c.get[Long]("expires_in").toOption
+      .orElse(
+        c.get[String]("expires_in").toOption.flatMap { s =>
+          val t = s.trim
+          if t.isEmpty then None
+          else
+            try Some(t.toLong)
+            catch case _: NumberFormatException => None
+        }
       )
 
   private def enc(s: String) = java.net.URLEncoder.encode(s, StandardCharsets.UTF_8)

@@ -69,6 +69,22 @@ object AuthSpec extends ZIOSpecDefault:
         yield assertTrue(ready, delivered, tok.accessToken == "issued", tok.refreshToken == "rt-new"))
           .ensuring(restore)
       }
+    },
+    test("callback state mismatch fails") {
+      assertTrue(
+        try
+          Auth.parseCallback("auth://callback?code=ok&state=other", "auth", Some("s1"))
+          false
+        catch case e: AuthError => e.getMessage.contains("state")
+      )
+    },
+    test("callback scheme mismatch fails") {
+      assertTrue(
+        try
+          Auth.parseCallback("https://evil.example/callback?code=ok", "auth", None)
+          false
+        catch case e: AuthError => e.getMessage.contains("scheme")
+      )
     }
   ) @@ TestAspect.withLiveClock
 
@@ -87,14 +103,16 @@ object MockBackend:
     val server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0)
     server.createContext(
       "/authorize-url",
-      (ex: HttpExchange) => json(ex, 200, """{"authUrl":"https://idp.example/authorize"}""")
+      (ex: HttpExchange) =>
+        json(ex, 200, """{"authUrl":"https://idp.example/authorize?state=s1"}""")
     )
     server.createContext(
       "/issue",
       (ex: HttpExchange) =>
         val body = read(ex)
         val code = parser.parse(body).toOption.flatMap(_.hcursor.downField("query").get[String]("code").toOption).getOrElse("")
-        if code == "ok" then json(ex, 200, """{"access_token":"issued","refresh_token":"rt-new","token_type":"Bearer","expires_in":3600}""")
+        if code == "ok" then
+          json(ex, 200, """{"access_token":"issued","refresh_token":"rt-new","token_type":"Bearer","expires_in":3600}""")
         else json(ex, 400, """{"error":"invalid_grant"}""")
     )
     server.createContext(

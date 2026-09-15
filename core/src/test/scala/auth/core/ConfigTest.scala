@@ -24,10 +24,19 @@ object ConfigSpec extends ZIOSpecDefault:
       )
     },
     test("missing API_BASE_URL is error") {
-      val err = try
-        Config.fromMap(Map(Config.TenantId -> "t"))
-        None
-      catch case e: AuthError => Some(e)
+      val err =
+        try
+          Config.fromMap(Map(Config.TenantId -> "t"))
+          None
+        catch case e: AuthError => Some(e)
+      assertTrue(err.isDefined)
+    },
+    test("redirect scheme must be a bare scheme") {
+      val err =
+        try
+          Config.of("https://api.example", "t", redirectScheme = "myapp://callback")
+          None
+        catch case e: AuthError => Some(e)
       assertTrue(err.isDefined)
     }
   )

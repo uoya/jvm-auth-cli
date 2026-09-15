@@ -15,4 +15,12 @@ object Browser:
         ()
       else if java.awt.Desktop.isDesktopSupported && java.awt.Desktop.getDesktop.isSupported(java.awt.Desktop.Action.BROWSE)
       then java.awt.Desktop.getDesktop.browse(URI.create(url))
-      else throw AuthError(s"no browser helper on $os")
+      else if os.contains("mac") then
+        new ProcessBuilder("open", url).start()
+        ()
+      else
+        try
+          new ProcessBuilder("xdg-open", url).start()
+          ()
+        catch case e: Exception =>
+          throw AuthError(s"no browser helper on $os (${e.getMessage})")

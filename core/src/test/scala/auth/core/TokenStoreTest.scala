@@ -14,12 +14,18 @@ object TokenStoreSpec extends ZIOSpecDefault:
         _ <- TokenStore.save(path, "https://api|b", Tokens("at-b"))
         a <- TokenStore.load(path, "https://api|a")
         b <- TokenStore.load(path, "https://api|b")
-        _ <- TokenStore.remove(path)
+        removed <- TokenStore.remove(path, "https://api|a")
+        stillB <- TokenStore.load(path, "https://api|b")
         missing <- TokenStore.load(path, "https://api|a").flip
+        _ <- TokenStore.removeAll(path)
+        gone <- TokenStore.load(path, "https://api|b").flip
       yield assertTrue(
         a.accessToken == "at-a",
         b.accessToken == "at-b",
-        missing == NotLoggedIn
+        removed,
+        stillB.accessToken == "at-b",
+        missing == NotLoggedIn,
+        gone == NotLoggedIn
       )
     },
     test("freshness") {
@@ -31,7 +37,21 @@ object TokenStoreSpec extends ZIOSpecDefault:
         TokenStore.fresh(live),
         !TokenStore.fresh(stale),
         !TokenStore.fresh(unknownWithRt),
-        TokenStore.fresh(unknownNoRt)
+        !TokenStore.fresh(unknownNoRt)
       )
+    },
+    test("owner-only permissions on posix") {
+      val path = Files.createTempDirectory("auth").resolve("credentials")
+      for
+        _ <- TokenStore.save(path, "https://api|a", Tokens("secret", "rt"))
+        perms <- AuthError.block:
+          try
+            val p = Files.getPosixFilePermissions(path)
+            !p.contains(java.nio.file.attribute.PosixFilePermission.GROUP_READ) &&
+            !p.contains(java.nio.file.attribute.PosixFilePermission.OTHERS_READ) &&
+            !p.contains(java.nio.file.attribute.PosixFilePermission.GROUP_WRITE) &&
+            !p.contains(java.nio.file.attribute.PosixFilePermission.OTHERS_WRITE)
+          catch case _: UnsupportedOperationException => true
+      yield assertTrue(perms)
     }
   )
