@@ -25,7 +25,9 @@ object Config:
   val TokenFile = "TOKEN_FILE"
   val OutFile = "OAUTH_OUTFILE"
 
+  private val SchemeRe = raw"^[a-zA-Z][a-zA-Z0-9+.-]*$$".r
   private val DefaultScheme: NonEmptyStr = "auth".refineUnsafe[MinLength[1]]
+  private val MaxEnvBytes = 1048576L
 
   def of(
       apiBaseUrl: String,
@@ -50,15 +52,21 @@ object Config:
     Config(
       apiBaseUrl = need(ApiBaseUrl, env.getOrElse(ApiBaseUrl, "")),
       tenantId = need(TenantId, env.getOrElse(TenantId, "")),
-      redirectScheme = env.get(RedirectScheme).map(_.trim).filter(_.nonEmpty).map(need(RedirectScheme, _)).getOrElse(DefaultScheme),
+      redirectScheme = env
+        .get(RedirectScheme)
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .map(scheme)
+        .getOrElse(DefaultScheme),
       tokenFile = token.map(Path.of(_)).getOrElse(TokenStore.defaultPath(env))
     )
 
   def loadFile(path: Path): Map[String, String] =
     if !Files.exists(path) then throw AuthError(s"env $path: not found")
     if Files.isDirectory(path) then throw AuthError(s"$path はディレクトリです。env ファイルを指定してください")
+    val size = Files.size(path)
+    if size > MaxEnvBytes then throw AuthError(s"env $path: file too large")
     val raw = Files.readString(path, StandardCharsets.UTF_8)
-    if raw.length > 1048576 then throw AuthError(s"env $path: file too large")
     parse(raw)
 
   def parse(raw: String): Map[String, String] =
@@ -84,6 +92,11 @@ object Config:
         case Some(v) => acc + (k -> v)
         case None    => acc
     }
+
+  private def scheme(raw: String): NonEmptyStr =
+    val s = raw.trim
+    if SchemeRe.matches(s) && !s.contains("://") then need(RedirectScheme, s)
+    else throw AuthError(s"$RedirectScheme は URI scheme のみです（例: auth）: $raw")
 
   private def need(name: String, raw: String): NonEmptyStr =
     raw.trim.refineEither[MinLength[1]] match

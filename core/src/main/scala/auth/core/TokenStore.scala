@@ -4,8 +4,10 @@ import io.circe.{Json as CirceJson, JsonObject, Printer}
 import io.circe.syntax.*
 import zio.IO
 
+import java.nio.channels.FileChannel
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path, StandardCopyOption}
+import java.nio.file.attribute.PosixFilePermissions
+import java.nio.file.{AtomicMoveNotSupportedException, Files, Path, StandardCopyOption, StandardOpenOption}
 import java.time.Instant
 
 final case class Tokens(
@@ -18,6 +20,7 @@ final case class Tokens(
 object TokenStore:
   private val skew = java.time.Duration.ofSeconds(30)
   private val pretty = Printer.spaces2.copy(dropNullValues = true)
+  private val OwnerOnly = PosixFilePermissions.fromString("rw-------")
 
   def defaultPath(env: Map[String, String] = sys.env): Path =
     env.get(Config.OutFile).filter(_.nonEmpty).orElse(env.get(Config.TokenFile).filter(_.nonEmpty)) match
@@ -32,26 +35,49 @@ object TokenStore:
 
   def save(path: Path, key: String, tokens: Tokens): IO[AuthError, Unit] =
     AuthError.block:
-      val all = read(path)
-      write(path, all.add(normalize(key), toJson(tokens)))
+      withFileLock(path):
+        val all = read(path)
+        write(path, all.add(normalize(key), toJson(tokens)))
 
   def load(path: Path, key: String): IO[AuthError, Tokens] =
     AuthError.block:
-      read(path)(normalize(key)) match
-        case None => throw NotLoggedIn
-        case Some(n) =>
-          val t = fromJson(n)
-          if t.accessToken.isEmpty then throw NotLoggedIn
-          t
+      withFileLock(path):
+        read(path)(normalize(key)) match
+          case None => throw NotLoggedIn
+          case Some(n) =>
+            val t = fromJson(n)
+            if t.accessToken.isEmpty then throw NotLoggedIn
+            t
 
-  def remove(path: Path): IO[AuthError, Boolean] =
-    AuthError.block(Files.deleteIfExists(path))
+  /** Remove one tenant entry. Deletes the file when empty. */
+  def remove(path: Path, key: String): IO[AuthError, Boolean] =
+    AuthError.block:
+      withFileLock(path):
+        if !Files.exists(path) then false
+        else
+          val k = normalize(key)
+          val all = read(path)
+          if !all.contains(k) then false
+          else
+            val next = all.remove(k)
+            if next.isEmpty then
+              Files.deleteIfExists(path)
+              true
+            else
+              write(path, next)
+              true
+
+  /** Wipe the entire credentials file (all tenants). */
+  def removeAll(path: Path): IO[AuthError, Boolean] =
+    AuthError.block:
+      withFileLock(path):
+        Files.deleteIfExists(path)
 
   def fresh(t: Tokens, now: Instant = Instant.now): Boolean =
     if t.accessToken.isEmpty then false
     else
       t.expiresAt match
-        case None      => t.refreshToken.isEmpty
+        case None      => false
         case Some(exp) => now.isBefore(exp.minus(skew))
 
   private def windows = java.lang.System.getProperty("os.name", "").toLowerCase.contains("win")
@@ -61,6 +87,18 @@ object TokenStore:
     if s.isEmpty then throw AuthError("store key is required")
     s
 
+  private def lockPath(path: Path): Path = Path.of(path.toString + ".lock")
+
+  private def withFileLock[A](path: Path)(body: => A): A =
+    val parent = Option(path.getParent).getOrElse(Path.of("."))
+    Files.createDirectories(parent)
+    val ch = FileChannel.open(lockPath(path), StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+    try
+      val lock = ch.lock()
+      try body
+      finally lock.release()
+    finally ch.close()
+
   private def read(path: Path): JsonObject =
     if !Files.exists(path) then JsonObject.empty
     else
@@ -68,14 +106,41 @@ object TokenStore:
       n.asObject.getOrElse(throw AuthError(s"$path: JSON object required"))
 
   private def write(path: Path, all: JsonObject): Unit =
-    Files.createDirectories(Option(path.getParent).getOrElse(Path.of(".")))
+    val parent = Option(path.getParent).getOrElse(Path.of("."))
+    Files.createDirectories(parent)
     val bytes = pretty.print(CirceJson.fromJsonObject(all)).getBytes(StandardCharsets.UTF_8)
     val tmp = Path.of(path.toString + ".tmp")
+    Files.deleteIfExists(tmp)
+    createOwnerOnlyFile(tmp)
     Files.write(tmp, bytes)
-    Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-    path.toFile.setReadable(false, false)
-    path.toFile.setReadable(true, true)
-    path.toFile.setWritable(true, true)
+    restrictOwnerOnly(tmp)
+    try Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+    catch
+      case _: AtomicMoveNotSupportedException =>
+        Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING)
+    restrictOwnerOnly(path)
+
+  private def createOwnerOnlyFile(path: Path): Unit =
+    try
+      Files.createFile(path, PosixFilePermissions.asFileAttribute(OwnerOnly))
+    catch
+      case _: UnsupportedOperationException =>
+        Files.createFile(path)
+        restrictOwnerOnly(path)
+
+  private def restrictOwnerOnly(path: Path): Unit =
+    try
+      Files.setPosixFilePermissions(path, OwnerOnly)
+    catch
+      case _: UnsupportedOperationException =>
+        val f = path.toFile
+        val ok =
+          f.setReadable(false, false) &&
+            f.setWritable(false, false) &&
+            f.setExecutable(false, false) &&
+            f.setReadable(true, true) &&
+            f.setWritable(true, true)
+        if !ok then throw AuthError(s"$path: could not restrict file permissions to owner-only")
 
   private def toJson(t: Tokens): CirceJson =
     var fields = Vector(
@@ -89,7 +154,9 @@ object TokenStore:
   private def fromJson(n: CirceJson) =
     val exp = Json.str(n, "expires_at") match
       case "" => None
-      case s  => Some(Instant.parse(s))
+      case s =>
+        try Some(Instant.parse(s))
+        catch case e: Exception => throw AuthError(s"invalid expires_at: $s (${e.getMessage})")
     Tokens(
       accessToken = Json.str(n, "access_token"),
       refreshToken = Json.str(n, "refresh_token"),

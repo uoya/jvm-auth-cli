@@ -13,7 +13,7 @@ import java.time.format.DateTimeFormatter
 sealed trait Cmd
 object Cmd:
   final case class Token(env: Path, timeout: Duration, outfile: Option[Path]) extends Cmd
-  final case class Logout(outfile: Option[Path]) extends Cmd
+  final case class Logout(env: Path, outfile: Option[Path], all: Boolean) extends Cmd
   final case class Callback(uri: String) extends Cmd
 
 object Main extends ZIOCliDefault:
@@ -24,7 +24,10 @@ object Main extends ZIOCliDefault:
     Options
       .text("timeout")
       .mapOrFail(parseDuration)
-      .withDefault(Duration.ofMinutes(5)) ?? "ブラウザログインの待ち時間（既定 5m）"
+      .withDefault(Duration.ofMinutes(5)) ?? "ブラウザログインの待ち時間（既定 5m、単位必須）"
+
+  private val allFlag =
+    Options.boolean("all").withDefault(false) ?? "全テナントのトークンを削除する"
 
   private val tokenIn: Options[(Option[Path], Duration)] = outfile ++ timeout
 
@@ -36,10 +39,15 @@ object Main extends ZIOCliDefault:
       }
       .withHelp("利用可能な access_token を標準出力へ JSON で出す")
 
+  private val logoutIn: Options[(Option[Path], Boolean)] = outfile ++ allFlag
+
   private val logout: Command[Cmd] =
-    Command("logout", outfile)
-      .map(out => Cmd.Logout(out))
-      .withHelp("トークンファイルを削除する")
+    Command("logout", logoutIn, Args.file("env", Exists.Yes) ?? "設定.env")
+      .map { (in: (Option[Path], Boolean), env: Path) =>
+        val (out, all) = in
+        Cmd.Logout(env, out, all)
+      }
+      .withHelp("当該テナントのトークンを削除する（--all でファイル全体）")
 
   val command: Command[Cmd] =
     Command("auth").subcommands(token, logout)
@@ -54,14 +62,14 @@ object Main extends ZIOCliDefault:
   /** OS のカスタムスキーム起動だけ先に拾い、残りは zio-cli。 */
   override def run =
     ZIOAppArgs.getArgs.flatMap { args =>
-      args.find(isProtocol) match
+      args.find(isCallbackUri) match
         case Some(uri) =>
           runCmd(Cmd.Callback(uri)).catchAll(fail)
         case None =>
           cliApp.run(args.toList).catchAll {
-            case CliError.Parsing(_)            => exit(ExitCode.failure)
+            case CliError.Parsing(_)              => exit(ExitCode.failure)
             case CliError.Execution(e: AuthError) => fail(e)
-            case e                              => fail(AuthError(e.getMessage))
+            case e                                => fail(AuthError(e.getMessage))
           }.unit
     }
 
@@ -74,14 +82,17 @@ object Main extends ZIOCliDefault:
           tok <- Auth.fromConfig(cfg).access(timeout)
           _ <- Console.printLine(stdoutJson(tok)).orDie
         yield ()
-      case Cmd.Logout(outfile) =>
-        val path = outfile.getOrElse(TokenStore.defaultPath())
+      case Cmd.Logout(env, outfile, all) =>
         for
-          existed <- AuthError.block(Files.exists(path))
-          _ <- TokenStore.remove(path)
+          cfg0 <- AuthError.block(Config.fromEnvFile(env))
+          cfg = outfile.fold(cfg0)(o => cfg0.copy(tokenFile = o))
+          existed <- AuthError.block(Files.exists(cfg.tokenFile))
           _ <-
-            if existed then Console.printLineError(s"logged out; removed $path").orDie
-            else Console.printLineError(s"logged out; no token file at $path").orDie
+            if all then TokenStore.removeAll(cfg.tokenFile)
+            else TokenStore.remove(cfg.tokenFile, cfg.storeKey)
+          _ <-
+            if existed then Console.printLineError(s"logged out; updated ${cfg.tokenFile}").orDie
+            else Console.printLineError(s"logged out; no token file at ${cfg.tokenFile}").orDie
         yield ()
       case Cmd.Callback(uri) =>
         Auth.deliverProtocolUri(uri).flatMap { ok =>
@@ -91,8 +102,23 @@ object Main extends ZIOCliDefault:
   private def fail(e: AuthError) =
     Console.printLineError("error: " + e.getMessage).orDie *> exit(ExitCode.failure)
 
-  private def isProtocol(a: String) =
-    a.contains("://") && !a.startsWith("-")
+  /** Only bare custom-scheme callback URIs — not env paths or https URLs. */
+  private def isCallbackUri(a: String): Boolean =
+    !a.startsWith("-") && {
+      try
+        val uri = java.net.URI.create(a)
+        val scheme = uri.getScheme
+        val schemeOk =
+          scheme != null &&
+            scheme.matches("(?i)[a-z][a-z0-9+.-]*") &&
+            !scheme.equalsIgnoreCase("http") &&
+            !scheme.equalsIgnoreCase("https") &&
+            !scheme.equalsIgnoreCase("file")
+        val hostOk = Option(uri.getHost).exists(_.equalsIgnoreCase("callback"))
+        val sspOk = uri.getHost == null && Option(uri.getSchemeSpecificPart).exists(_.startsWith("//callback"))
+        schemeOk && (hostOk || sspOk)
+      catch case _: Exception => false
+    }
 
   private def stdoutJson(tok: Tokens): String =
     var fields = Vector(
@@ -103,12 +129,24 @@ object Main extends ZIOCliDefault:
     io.circe.Json.obj(fields*).noSpaces
 
   private def parseDuration(s: String): Either[ValidationError, Duration] =
-    try
-      val d = scala.concurrent.duration.Duration(s)
-      if d.isFinite then Right(Duration.ofNanos(d.toNanos))
-      else Left(invalidDuration(s))
-    catch case e: Exception =>
-      Left(ValidationError(ValidationErrorType.InvalidArgument, HelpDoc.p(Option(e.getMessage).getOrElse(s"invalid duration \"$s\""))))
+    val trimmed = s.trim
+    if trimmed.forall(c => c.isDigit || c == '.') then Left(invalidDuration(s))
+    else
+      try
+        val d = scala.concurrent.duration.Duration(trimmed)
+        if !d.isFinite then Left(invalidDuration(s))
+        else if d.toNanos <= 0 then Left(invalidDuration(s))
+        else Right(Duration.ofNanos(d.toNanos))
+      catch case e: Exception =>
+        Left(
+          ValidationError(
+            ValidationErrorType.InvalidArgument,
+            HelpDoc.p(Option(e.getMessage).getOrElse(s"invalid duration \"$s\""))
+          )
+        )
 
   private def invalidDuration(s: String) =
-    ValidationError(ValidationErrorType.InvalidArgument, HelpDoc.p(s"invalid duration \"$s\""))
+    ValidationError(
+      ValidationErrorType.InvalidArgument,
+      HelpDoc.p(s"invalid duration \"$s\" (use a unit, e.g. 5m / 30s)")
+    )

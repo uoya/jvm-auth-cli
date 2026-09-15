@@ -7,7 +7,7 @@ sbt "cli/run -- token -- app.env"
 scala-cli run cli -- token -- app.env
 ```
 
-stdout は `access_token` のみ。`refresh_token` は出しません。引数は [zio-cli](https://zio.dev/zio-cli/) が処理します（`--help` で用法）。
+stdout は JSON（`access_token` / `token_type` / 任意で `expires_at`）。`refresh_token` は出しません。引数は [zio-cli](https://zio.dev/zio-cli/) が処理します（`--help` で用法）。
 
 ## 構成
 
@@ -44,34 +44,46 @@ TENANT_ID=acme
 |---|---|
 | `API_BASE_URL` | バックエンドのベース URL |
 | `TENANT_ID` | テナント |
-| `REDIRECT_SCHEME` | 省略時 `auth`（戻り URI は `auth://callback`） |
-| `TOKEN_FILE` / `OAUTH_OUTFILE` | トークンファイル。省略時は `%AppData%\oauth-token\credentials` |
+| `REDIRECT_SCHEME` | 省略時 `auth`（戻り URI は `auth://callback`）。`://` を含めるとエラー |
+| `TOKEN_FILE` / `OAUTH_OUTFILE` | トークンファイル。省略時は Windows `%AppData%\oauth-token\credentials`、それ以外 `~/.config/oauth-token/credentials` |
 
 ## コマンド
 
 ```text
 sbt "cli/run -- token --timeout 5m -- app.env"
-sbt "cli/run -- --outfile PATH token -- app.env"
-sbt "cli/run -- logout"
-sbt "cli/run"
+sbt "cli/run -- token --outfile PATH -- app.env"
+sbt "cli/run -- logout -- app.env"
+sbt "cli/run -- logout --all -- app.env"
 
 scala-cli run cli -- token --timeout 5m -- app.env
-scala-cli run cli -- logout
-scala-cli run cli
+scala-cli run cli -- logout -- app.env
 ```
 
-カスタムスキームの戻り:
+- `--timeout` は単位必須（`5m` / `30s`）。単位なしの数値はエラーです。
+- `logout` は env からパスとテナントキーを決め、**当該テナントだけ**消します。`--all` のときだけファイル全体を削除します。
+
+カスタムスキームの戻り（OS が後発プロセスを起動）:
 
 ```text
 sbt "cli/run -- auth://callback?code=...&state=..."
 ```
+
+`http` / `https` / `file` や env パスは callback 判定しません。OS への `auth://`（または `REDIRECT_SCHEME`）登録は利用側の責務です。
+
+## セキュリティ上の契約
+
+- トークンファイルは作成時点から所有者のみ読み書き（POSIX `0600`）。一時ファイルも同様です。
+- ログイン待ちの IPC は loopback + 一回限りの nonce（`instance.session`、所有者のみ）。scheme 不一致・過大ペイロードは破棄します。
+- callback は `REDIRECT_SCHEME` と一致する URI のみ受理します。認可 URL に `state` があれば callback の `state` と照合します（login CSRF 対策の一端。完全な CSRF 防御はバックエンドの `state` 検証と合わせてください）。
+- `expires_at` / `expires_in` が無い・解釈不能なトークンは fresh とみなしません。
+- HTTP 400/401 だけ再ログイン。それ以外の失敗ではブラウザを開きません。
 
 ## バックエンド API
 
 `GET {API_BASE_URL}/authorize-url?tenantId=&redirect_uri=`
 
 ```json
-{"authUrl":"https://idp.example/oauth2/authorize?..."}
+{"authUrl":"https://idp.example/oauth2/authorize?...&state=..."}
 ```
 
 `POST {API_BASE_URL}/issue`
@@ -89,8 +101,6 @@ sbt "cli/run -- auth://callback?code=...&state=..."
 ```json
 {"tenantId":"acme","refresh_token":"..."}
 ```
-
-400/401 は再ログイン、それ以外の失敗はブラウザを開きません。
 
 ## Build
 
